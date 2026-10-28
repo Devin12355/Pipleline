@@ -16,6 +16,7 @@ public final class StageRecord {
     private final Instant endTime;
     private final long durationMs;
     private final String error;
+    private final int attempts;
 
     public StageRecord(int index,
                        String stageName,
@@ -25,6 +26,18 @@ public final class StageRecord {
                        Instant startTime,
                        Instant endTime,
                        String error) {
+        this(index, stageName, loopName, iteration, status, startTime, endTime, error, 1);
+    }
+
+    public StageRecord(int index,
+                       String stageName,
+                       String loopName,
+                       int iteration,
+                       StageStatus status,
+                       Instant startTime,
+                       Instant endTime,
+                       String error,
+                       int attempts) {
         this.index = index;
         this.stageName = stageName;
         this.loopName = loopName;
@@ -35,32 +48,44 @@ public final class StageRecord {
         this.durationMs = (startTime == null || endTime == null) ? -1L
                 : endTime.toEpochMilli() - startTime.toEpochMilli();
         this.error = error;
+        this.attempts = Math.max(1, attempts);
     }
 
     public static StageRecord success(int index, String stageName, String loopName, int iteration,
                                       Instant start, Instant end) {
-        return new StageRecord(index, stageName, loopName, iteration, StageStatus.SUCCESS, start, end, null);
+        return new StageRecord(index, stageName, loopName, iteration, StageStatus.SUCCESS, start, end, null, 1);
+    }
+
+    public static StageRecord success(int index, String stageName, String loopName, int iteration,
+                                      Instant start, Instant end, int attempts) {
+        return new StageRecord(index, stageName, loopName, iteration, StageStatus.SUCCESS, start, end, null, attempts);
     }
 
     public static StageRecord skipped(int index, String stageName, String loopName, int iteration,
                                       Instant start, Instant end) {
-        return new StageRecord(index, stageName, loopName, iteration, StageStatus.SKIPPED, start, end, null);
+        return new StageRecord(index, stageName, loopName, iteration, StageStatus.SKIPPED, start, end, null, 1);
     }
 
     public static StageRecord cancelled(int index, String stageName, String loopName, int iteration,
                                         Instant start, Instant end) {
-        return new StageRecord(index, stageName, loopName, iteration, StageStatus.CANCELLED, start, end, null);
+        return new StageRecord(index, stageName, loopName, iteration, StageStatus.CANCELLED, start, end, null, 1);
     }
 
     public static StageRecord failed(int index, String stageName, String loopName, int iteration,
                                      Instant start, Instant end, Throwable error) {
         return new StageRecord(index, stageName, loopName, iteration, StageStatus.FAILED, start, end,
-                describe(error));
+                describe(error), 1);
+    }
+
+    public static StageRecord failed(int index, String stageName, String loopName, int iteration,
+                                     Instant start, Instant end, Throwable error, int attempts) {
+        return new StageRecord(index, stageName, loopName, iteration, StageStatus.FAILED, start, end,
+                describe(error), attempts);
     }
 
     public static StageRecord failed(int index, String stageName, String loopName, int iteration,
                                      Instant start, Instant end, String error) {
-        return new StageRecord(index, stageName, loopName, iteration, StageStatus.FAILED, start, end, error);
+        return new StageRecord(index, stageName, loopName, iteration, StageStatus.FAILED, start, end, error, 1);
     }
 
     private static String describe(Throwable error) {
@@ -80,7 +105,7 @@ public final class StageRecord {
         return stageName;
     }
 
-    /** Name of the enclosing loop, {@code null} when the stage is not part of a loop. */
+    /** Scope path of the stage: enclosing loop / parallel / sub-pipeline, {@code null} at top level. */
     public String loopName() {
         return loopName;
     }
@@ -110,6 +135,11 @@ public final class StageRecord {
         return error;
     }
 
+    /** How many times the stage body ran (>= 1; > 1 means it was retried). */
+    public int attempts() {
+        return attempts;
+    }
+
     public boolean inLoop() {
         return loopName != null;
     }
@@ -119,6 +149,7 @@ public final class StageRecord {
         return "#" + index + " " + stageName
                 + (loopName == null ? "" : " (" + loopName + "#" + iteration + ")")
                 + " " + status + " " + durationMs + "ms"
+                + (attempts > 1 ? " x" + attempts : "")
                 + (error == null ? "" : " error=" + error);
     }
 }

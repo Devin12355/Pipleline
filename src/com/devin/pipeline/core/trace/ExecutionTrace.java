@@ -31,8 +31,8 @@ public final class ExecutionTrace {
         this.startTime = startTime == null ? Instant.now() : startTime;
     }
 
-    /** Appends a stage record; called by the engine in execution order. */
-    public void add(StageRecord record) {
+    /** Appends a stage record; called by the engine in execution order (thread safe). */
+    public synchronized void add(StageRecord record) {
         if (record != null) {
             records.add(record);
         }

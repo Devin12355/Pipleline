@@ -1,5 +1,7 @@
 package com.devin.pipeline.core;
 
+import com.devin.pipeline.core.control.RetryPolicy;
+
 import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
@@ -28,6 +30,15 @@ public interface Stage<C> {
 
     /** Business logic. Throwing signals a real failure and routes to the error policy. */
     void handle(StageContext<C> ctx) throws Exception;
+
+    /**
+     * Per-stage retry policy; {@code null} means "use the pipeline default".
+     * Only meaningful for plain stages: engine-managed types (loop, sub-pipeline, parallel)
+     * configure retries through their own options instead.
+     */
+    default RetryPolicy retry() {
+        return null;
+    }
 
     /** Lambda friendly factory: always runs. */
     static <C> Stage<C> of(String name, Consumer<StageContext<C>> handler) {
@@ -60,6 +71,38 @@ public interface Stage<C> {
             @Override
             public String toString() {
                 return "Stage[" + name + "]";
+            }
+        };
+    }
+
+    /** Wraps any stage with a retry policy; the wrapped stage keeps its name and behaviour. */
+    static <C> Stage<C> withRetry(Stage<C> stage, RetryPolicy policy) {
+        Objects.requireNonNull(stage, "stage");
+        Objects.requireNonNull(policy, "policy");
+        return new Stage<C>() {
+            @Override
+            public String name() {
+                return stage.name();
+            }
+
+            @Override
+            public boolean accept(StageContext<C> ctx) {
+                return stage.accept(ctx);
+            }
+
+            @Override
+            public void handle(StageContext<C> ctx) throws Exception {
+                stage.handle(ctx);
+            }
+
+            @Override
+            public RetryPolicy retry() {
+                return policy;
+            }
+
+            @Override
+            public String toString() {
+                return "Stage[" + stage.name() + ", " + policy + "]";
             }
         };
     }

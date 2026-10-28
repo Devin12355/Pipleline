@@ -4,6 +4,7 @@ import com.devin.pipeline.core.control.CancelToken;
 import com.devin.pipeline.core.control.ErrorAction;
 import com.devin.pipeline.core.control.ErrorHandler;
 import com.devin.pipeline.core.control.Interceptor;
+import com.devin.pipeline.core.control.RetryPolicy;
 import com.devin.pipeline.core.event.PipelineEvent;
 import com.devin.pipeline.core.event.PipelineListener;
 import com.devin.pipeline.core.execution.ExecutionResult;
@@ -26,6 +27,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 
@@ -33,8 +35,9 @@ import java.util.function.Predicate;
  * The engine: an immutable, thread safe description of a workflow that can be executed many times,
  * by many threads, concurrently.
  *
- * <p>One execution always runs on a single thread: stages, interceptors, error handling, trace
- * capture and exporters all run there, so no locks are needed anywhere.
+ * <p>One execution always runs on a single thread (the opt-in {@link ParallelStage} being the
+ * documented exception), so stages, interceptors, error handling, trace capture and exporters
+ * need no locks.
  *
  * @param <C> payload type
  */
@@ -123,16 +126,71 @@ public final class Pipeline<C> {
         }
     }
 
+    /**
+     * Runs another {@link Pipeline} as a single stage. The engine executes the child with the
+     * <b>same</b> {@link StageContext}, trace, cancel token and deadline: attrs are shared,
+     * child stage records land in the same trace, and abort/skip/cancel propagate to the parent.
+     *
+     * <p>The child pipeline's own timeout, error handler and interceptors apply to its stages;
+     * its exporters and listeners are not triggered when nested.
+     *
+     * @param <C> payload type
+     */
+    public static final class SubPipelineStage<C> implements Stage<C> {
+
+        private final String name;
+        private final Pipeline<C> subPipeline;
+
+        public SubPipelineStage(String name, Pipeline<C> subPipeline) {
+            this.name = Objects.requireNonNull(name, "name");
+            this.subPipeline = Objects.requireNonNull(subPipeline, "subPipeline");
+        }
+
+        @Override
+        public String name() {
+            return name;
+        }
+
+        public Pipeline<C> subPipeline() {
+            return subPipeline;
+        }
+
+        /** Fallback used when such a stage is driven without the engine. */
+        @Override
+        public void handle(StageContext<C> ctx) {
+            ExecutionResult<C> result = subPipeline.execute(ctx.payload());
+            if (result.state() == ExecutionState.ABORTED) {
+                ctx.abort(result.reason().message());
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "SubPipelineStage[" + name + " -> " + subPipeline.name() + "]";
+        }
+    }
+
     /** Per-execution bookkeeping. Never shared between executions. */
     private static final class Exec<C> {
         final ExecutionHandle<C> handle;
         final StageContext<C> ctx;
-        int index;
-        long deadline = Long.MAX_VALUE;
+        final AtomicInteger index = new AtomicInteger();
+        volatile long deadline = Long.MAX_VALUE;
 
         Exec(ExecutionHandle<C> handle, StageContext<C> ctx) {
             this.handle = handle;
             this.ctx = ctx;
+        }
+    }
+
+    /** Result of running a stage list: why it stopped (if it did) and where it stopped. */
+    private static final class Outcome {
+        final FlowReason stop;
+        final int next;
+
+        Outcome(FlowReason stop, int next) {
+            this.stop = stop;
+            this.next = next;
         }
     }
 
@@ -147,6 +205,7 @@ public final class Pipeline<C> {
     private final List<PipelineListener<C>> listeners;
     private final long timeoutMs;
     private final boolean traceEnabled;
+    private final RetryPolicy defaultRetry;
 
     /**
      * Called by {@code PipelineBuilder}. Instances are immutable afterwards and safe to share
@@ -160,7 +219,8 @@ public final class Pipeline<C> {
                     List<TraceExporter> exporters,
                     List<PipelineListener<C>> listeners,
                     long timeoutMs,
-                    boolean traceEnabled) {
+                    boolean traceEnabled,
+                    RetryPolicy defaultRetry) {
         this.name = Objects.requireNonNull(name, "name");
         this.stages = List.copyOf(stages == null ? List.of() : stages);
         this.finallyStages = List.copyOf(finallyStages == null ? List.of() : finallyStages);
@@ -170,6 +230,7 @@ public final class Pipeline<C> {
         this.listeners = List.copyOf(listeners == null ? List.of() : listeners);
         this.timeoutMs = timeoutMs;
         this.traceEnabled = traceEnabled;
+        this.defaultRetry = defaultRetry;
     }
 
     public String name() {
@@ -194,6 +255,11 @@ public final class Pipeline<C> {
 
     public boolean traceEnabled() {
         return traceEnabled;
+    }
+
+    /** Pipeline-wide default retry policy; {@code null} means a single attempt. */
+    public RetryPolicy defaultRetry() {
+        return defaultRetry;
     }
 
     /** Runs every stage on the caller thread and returns the terminal result. */
@@ -249,32 +315,19 @@ public final class Pipeline<C> {
         transition(e, ExecutionState.RUNNING, FlowReason.normal("started"));
         emit(e, PipelineEvent.pipelineStart(e.handle.traceId(), name));
 
-        FlowReason stop = null;
-        int pending = 0;
-        for (int i = 0; i < stages.size(); i++) {
-            stop = checkStop(ctx, e.deadline);
-            if (stop != null) {
-                pending = i;
-                break;
-            }
-            pending = i + 1;
-            FlowReason failed = runUnit(e, trace, stages.get(i), null, 0, null);
-            if (failed != null) {
-                stop = failed;
-                break;
-            }
-        }
+        Outcome outcome = runStageList(e, trace, stages, null, 0, null);
+        FlowReason stop = outcome.stop;
         if (stop == null) {
             stop = checkStop(ctx, e.deadline);
         }
         if (stop == null) {
             stop = FlowReason.normal();
         }
-        if (pending < stages.size()) {
-            markRemaining(e, trace, pending, stop);
+        if (outcome.next < stages.size()) {
+            markRemaining(e, trace, outcome.next, stop);
         }
 
-        runFinally(e, trace);
+        runFinally(e, trace, null, 0);
 
         ExecutionState terminal = terminalOf(stop);
         Instant end = Instant.now();
@@ -291,32 +344,56 @@ public final class Pipeline<C> {
                 start, end);
     }
 
-    private FlowReason runUnit(Exec<C> e,
-                               ExecutionTrace trace,
-                               Stage<C> stage,
-                               String loopName,
-                               int iteration,
-                               ErrorAction outerPolicy) {
-        if (stage instanceof LoopStage<C> loop) {
-            return runLoop(e, trace, loop, outerPolicy);
+    /**
+     * Runs a list of stages sequentially; the single checkpoint loop of the engine.
+     *
+     * @param scope  record scope path ({@code null} at top level, loop/parallel name deeper)
+     * @param iteration current loop iteration for records
+     * @param errorPolicy error action override inherited from an enclosing loop
+     */
+    private Outcome runStageList(Exec<C> e, ExecutionTrace trace, List<Stage<C>> list,
+                                 String scope, int iteration, ErrorAction errorPolicy) {
+        for (int i = 0; i < list.size(); i++) {
+            FlowReason stop = checkStop(e.ctx, e.deadline);
+            if (stop != null) {
+                return new Outcome(stop, i);
+            }
+            FlowReason failed = runUnit(e, trace, list.get(i), scope, iteration, errorPolicy);
+            if (failed != null) {
+                return new Outcome(failed, i + 1);
+            }
         }
-        return runStage(e, trace, stage, loopName, iteration, outerPolicy);
+        return new Outcome(null, list.size());
+    }
+
+    private FlowReason runUnit(Exec<C> e, ExecutionTrace trace, Stage<C> stage,
+                               String scope, int iteration, ErrorAction errorPolicy) {
+        if (stage instanceof LoopStage<C> loop) {
+            return runLoop(e, trace, loop, scope, errorPolicy);
+        }
+        if (stage instanceof SubPipelineStage<C> sub) {
+            return sub.subPipeline().runNested(e, trace, scope, iteration, errorPolicy, e.deadline);
+        }
+        if (stage instanceof ParallelStage<C> parallel) {
+            return runParallel(e, trace, parallel, scope, iteration, errorPolicy);
+        }
+        return runStage(e, trace, stage, scope, iteration, errorPolicy);
     }
 
     private FlowReason runStage(Exec<C> e,
                                 ExecutionTrace trace,
                                 Stage<C> stage,
-                                String loopName,
+                                String scope,
                                 int iteration,
                                 ErrorAction errorPolicy) {
         StageContext<C> ctx = e.ctx;
         String traceId = e.handle.traceId();
-        int index = e.index++;
+        int index = e.index.getAndIncrement();
         Instant start = Instant.now();
 
         ctx.setCurrentStage(stage.name());
         e.handle.markStage(stage.name());
-        emit(e, PipelineEvent.stageStart(traceId, name, stage.name(), loopName, iteration));
+        emit(e, PipelineEvent.stageStart(traceId, name, stage.name(), scope, iteration));
 
         boolean accepted;
         try {
@@ -324,8 +401,8 @@ public final class Pipeline<C> {
         } catch (Throwable t) {
             Throwable failure = unwrap(t);
             Instant end = Instant.now();
-            record(trace, StageRecord.failed(index, stage.name(), loopName, iteration, start, end, failure));
-            emit(e, PipelineEvent.stageFinish(traceId, name, stage.name(), loopName, iteration,
+            record(trace, StageRecord.failed(index, stage.name(), scope, iteration, start, end, failure));
+            emit(e, PipelineEvent.stageFinish(traceId, name, stage.name(), scope, iteration,
                     StageStatus.FAILED, elapsed(start, end), describe(failure)));
             return decide(ctx, stage, failure, errorPolicy) == ErrorAction.ABORT
                     ? FlowReason.failed(stage.name(), failure) : null;
@@ -333,46 +410,61 @@ public final class Pipeline<C> {
 
         if (!accepted) {
             Instant end = Instant.now();
-            record(trace, StageRecord.skipped(index, stage.name(), loopName, iteration, start, end));
-            emit(e, PipelineEvent.stageFinish(traceId, name, stage.name(), loopName, iteration,
+            record(trace, StageRecord.skipped(index, stage.name(), scope, iteration, start, end));
+            emit(e, PipelineEvent.stageFinish(traceId, name, stage.name(), scope, iteration,
                     StageStatus.SKIPPED, elapsed(start, end), null));
             return null;
         }
 
-        Throwable thrown = null;
-        for (Interceptor<C> interceptor : interceptors) {
-            guard(() -> interceptor.beforeStage(stage, ctx));
-        }
-        try {
-            executeBody(stage, ctx);
-        } catch (Throwable t) {
-            thrown = unwrap(t);
-        }
-        final Throwable failure = thrown;
-        Instant end = Instant.now();
+        RetryPolicy retry = stage.retry() != null ? stage.retry() : defaultRetry;
+        int maxAttempts = retry == null ? 1 : Math.max(1, retry.maxAttempts());
 
-        if (failure != null) {
+        int attempts = 0;
+        Throwable failure = null;
+        while (attempts < maxAttempts) {
+            attempts++;
             for (Interceptor<C> interceptor : interceptors) {
-                guard(() -> interceptor.onStageError(stage, ctx, failure));
+                guard(() -> interceptor.beforeStage(stage, ctx));
             }
-            record(trace, StageRecord.failed(index, stage.name(), loopName, iteration, start, end, failure));
-            emit(e, PipelineEvent.stageFinish(traceId, name, stage.name(), loopName, iteration,
-                    StageStatus.FAILED, elapsed(start, end), describe(failure)));
-            afterStage(stage, ctx);
-            return decide(ctx, stage, failure, errorPolicy) == ErrorAction.ABORT
-                    ? FlowReason.failed(stage.name(), failure) : null;
+            Throwable thrown = null;
+            try {
+                executeBody(stage, ctx);
+            } catch (Throwable t) {
+                thrown = unwrap(t);
+            }
+            final Throwable err = thrown;
+            if (err == null) {
+                afterStage(stage, ctx);
+                Instant end = Instant.now();
+                record(trace, StageRecord.success(index, stage.name(), scope, iteration, start, end, attempts));
+                emit(e, PipelineEvent.stageFinish(traceId, name, stage.name(), scope, iteration,
+                        StageStatus.SUCCESS, elapsed(start, end), null));
+                return null;
+            }
+            failure = err;
+            for (Interceptor<C> interceptor : interceptors) {
+                guard(() -> interceptor.onStageError(stage, ctx, err));
+            }
+            if (retry != null && retry.shouldRetry(attempts, err) && sleepBackoff(retry, attempts, ctx)) {
+                continue;
+            }
+            break;
         }
 
+        Instant end = Instant.now();
+        record(trace, StageRecord.failed(index, stage.name(), scope, iteration, start, end, failure, attempts));
+        emit(e, PipelineEvent.stageFinish(traceId, name, stage.name(), scope, iteration,
+                StageStatus.FAILED, elapsed(start, end), describe(failure)));
         afterStage(stage, ctx);
-        record(trace, StageRecord.success(index, stage.name(), loopName, iteration, start, end));
-        emit(e, PipelineEvent.stageFinish(traceId, name, stage.name(), loopName, iteration,
-                StageStatus.SUCCESS, elapsed(start, end), null));
-        return null;
+        return decide(ctx, stage, failure, errorPolicy) == ErrorAction.ABORT
+                ? FlowReason.failed(stage.name(), failure) : null;
     }
 
-    private FlowReason runLoop(Exec<C> e, ExecutionTrace trace, LoopStage<C> loop, ErrorAction outerPolicy) {
+    private FlowReason runLoop(Exec<C> e, ExecutionTrace trace, LoopStage<C> loop,
+                               String scope, ErrorAction outerPolicy) {
         StageContext<C> ctx = e.ctx;
         ErrorAction policy = loop.iterationErrorPolicy() != null ? loop.iterationErrorPolicy() : outerPolicy;
+        String loopScope = scope == null ? loop.name() : scope + "/" + loop.name();
         StageContext.LoopInfo previous = ctx.currentLoop();
         try {
             for (int iteration = 1; ; iteration++) {
@@ -403,7 +495,7 @@ public final class Pipeline<C> {
                         if (stop != null) {
                             return stop;
                         }
-                        FlowReason failed = runStage(e, trace, body, loop.name(), iteration, policy);
+                        FlowReason failed = runUnit(e, trace, body, loopScope, iteration, policy);
                         if (failed != null) {
                             return failed;
                         }
@@ -422,12 +514,67 @@ public final class Pipeline<C> {
         }
     }
 
-    private void runFinally(Exec<C> e, ExecutionTrace trace) {
+    private FlowReason runParallel(Exec<C> e, ExecutionTrace trace, ParallelStage<C> parallel,
+                                   String scope, int iteration, ErrorAction errorPolicy) {
+        String branchScope = scope == null ? parallel.name() : scope + "/" + parallel.name();
+        Executor executor = parallel.executor() != null ? parallel.executor() : ForkJoinPool.commonPool();
+        List<CompletableFuture<FlowReason>> futures = new ArrayList<>();
+        for (Stage<C> branch : parallel.branches()) {
+            CompletableFuture<FlowReason> future = CompletableFuture.supplyAsync(() -> {
+                try {
+                    FlowReason stop = checkStop(e.ctx, e.deadline);
+                    if (stop != null) {
+                        return stop;
+                    }
+                    return runUnit(e, trace, branch, branchScope, iteration, errorPolicy);
+                } catch (Throwable t) {
+                    return FlowReason.failed(branch.name(), unwrap(t));
+                }
+            }, executor);
+            futures.add(future);
+        }
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        for (CompletableFuture<FlowReason> future : futures) {
+            FlowReason reason = future.join();
+            if (reason != null) {
+                return reason;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Runs a child pipeline inside this execution: same context, trace, cancel token and
+     * (narrowed) deadline. Called by {@link SubPipelineStage} handling in {@link #runUnit}.
+     */
+    FlowReason runNested(Exec<C> e, ExecutionTrace trace, String scope, int iteration,
+                         ErrorAction inheritedPolicy, long outerDeadline) {
+        long deadline = outerDeadline;
+        if (timeoutMs > 0) {
+            long own = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+            deadline = Math.min(outerDeadline, own);
+        }
+        long saved = e.deadline;
+        e.deadline = deadline;
+        try {
+            Outcome outcome = runStageList(e, trace, stages, scope, iteration, inheritedPolicy);
+            FlowReason stop = outcome.stop;
+            if (stop == null) {
+                stop = checkStop(e.ctx, deadline);
+            }
+            runFinally(e, trace, scope, iteration);
+            return stop;
+        } finally {
+            e.deadline = saved;
+        }
+    }
+
+    private void runFinally(Exec<C> e, ExecutionTrace trace, String scope, int iteration) {
         StageContext<C> ctx = e.ctx;
         String traceId = e.handle.traceId();
         for (Stage<C> stage : finallyStages) {
             Instant start = Instant.now();
-            int index = e.index++;
+            int index = e.index.getAndIncrement();
             Throwable failure = null;
             boolean accepted = true;
             try {
@@ -440,16 +587,16 @@ public final class Pipeline<C> {
             }
             Instant end = Instant.now();
             if (failure != null) {
-                record(trace, StageRecord.failed(index, stage.name(), null, 0, start, end, failure));
-                emit(e, PipelineEvent.stageFinish(traceId, name, stage.name(), null, 0,
+                record(trace, StageRecord.failed(index, stage.name(), scope, iteration, start, end, failure));
+                emit(e, PipelineEvent.stageFinish(traceId, name, stage.name(), scope, iteration,
                         StageStatus.FAILED, elapsed(start, end), describe(failure)));
             } else if (accepted) {
-                record(trace, StageRecord.success(index, stage.name(), null, 0, start, end));
-                emit(e, PipelineEvent.stageFinish(traceId, name, stage.name(), null, 0,
+                record(trace, StageRecord.success(index, stage.name(), scope, iteration, start, end));
+                emit(e, PipelineEvent.stageFinish(traceId, name, stage.name(), scope, iteration,
                         StageStatus.SUCCESS, elapsed(start, end), null));
             } else {
-                record(trace, StageRecord.skipped(index, stage.name(), null, 0, start, end));
-                emit(e, PipelineEvent.stageFinish(traceId, name, stage.name(), null, 0,
+                record(trace, StageRecord.skipped(index, stage.name(), scope, iteration, start, end));
+                emit(e, PipelineEvent.stageFinish(traceId, name, stage.name(), scope, iteration,
                         StageStatus.SKIPPED, elapsed(start, end), null));
             }
         }
@@ -464,7 +611,7 @@ public final class Pipeline<C> {
         Instant now = Instant.now();
         for (int i = fromIndex; i < stages.size(); i++) {
             Stage<C> stage = stages.get(i);
-            int index = e.index++;
+            int index = e.index.getAndIncrement();
             record(trace, cancelled ? StageRecord.cancelled(index, stage.name(), null, 0, now, now)
                     : StageRecord.skipped(index, stage.name(), null, 0, now, now));
             emit(e, PipelineEvent.stageFinish(e.handle.traceId(), name, stage.name(), null, 0,
@@ -513,6 +660,26 @@ public final class Pipeline<C> {
         } catch (Throwable t) {
             return ErrorAction.ABORT;
         }
+    }
+
+    /** Backoff sleep in small slices so cancel/interrupt stay responsive; false = do not retry. */
+    private boolean sleepBackoff(RetryPolicy retry, int failedAttempt, StageContext<C> ctx) {
+        long remaining = retry.delayForAttempt(failedAttempt);
+        long step = 50L;
+        while (remaining > 0) {
+            if (ctx.cancelToken().isCancelled() || Thread.currentThread().isInterrupted()) {
+                return false;
+            }
+            long slice = Math.min(step, remaining);
+            try {
+                Thread.sleep(slice);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            remaining -= slice;
+        }
+        return true;
     }
 
     private void afterStage(Stage<C> stage, StageContext<C> ctx) {

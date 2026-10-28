@@ -66,6 +66,7 @@ public final class JsonTraceExporter implements TraceExporter {
                     .append(", \"startTime\": ").append(str(String.valueOf(r.startTime())))
                     .append(", \"endTime\": ").append(str(String.valueOf(r.endTime())))
                     .append(", \"durationMs\": ").append(r.durationMs())
+                    .append(", \"attempts\": ").append(r.attempts())
                     .append(", \"error\": ").append(str(r.error()))
                     .append('}')
                     .append(i == records.size() - 1 ? "\n" : ",\n");
