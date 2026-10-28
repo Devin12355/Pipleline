@@ -58,6 +58,22 @@ javac -encoding UTF-8 -d out/classes $(find src -name "*.java")   # plain javac
 mvn -q install       # then: com.devin:pipeline-core:1.0.0-SNAPSHOT
 ```
 
+**Export a library yourself (no repository tag needed):**
+
+```bash
+./scripts/export-lib.sh                    # Linux / macOS
+powershell -File .\scripts\export-lib.ps1  # Windows
+```
+
+Produces in `out/dist/`:
+
+| File | Use it for |
+|------|-----------|
+| `pipeline-core-1.0.0.jar` | JVM projects: `implementation files('libs/pipeline-core-1.0.0.jar')` |
+| `pipeline-core-1.0.0-sources.jar` | attach sources in the IDE |
+| `pipeline-core-1.0.0-src.zip` | copy `com/devin/pipeline` straight into your sources |
+| `pipeline-core-android/` (`--module` / `-AsModule`) | Android Studio module, ready to `include ':pipeline-core'` |
+
 ## Quick start
 
 ```java
@@ -684,7 +700,8 @@ cancellation where the finally stage still closes the camera.
 - **Shared external resources** (connection pools, stateful services) must be thread-safe on your
   side; the framework only guarantees that it shares nothing.
 - **Interceptors, listeners and exporters never change an outcome** — their exceptions are swallowed.
-- **Android**: the code uses `List.of()` / `List.copyOf()` / `String.isBlank()` (API 30+),
-  `java.time` (API 26+, or `coreLibraryDesugaring`) and `CompletableFuture` (API 24+).
+- **Android**: compile and export with `scripts/export-lib.ps1 -AsModule` — add
+  `coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'` for `java.time` and the
+  `List.of` / `Map.of` factory methods, and set `minSdk 24` (`java.util.concurrent.CompletableFuture`).
 
 Licensed under the [Apache License 2.0](LICENSE).

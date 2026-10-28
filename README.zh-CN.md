@@ -57,6 +57,22 @@ javac -encoding UTF-8 -d out/classes $(find src -name "*.java")  # 纯 javac
 mvn -q install        # 装到本地仓库后使用 com.devin:pipeline-core:1.0.0-SNAPSHOT
 ```
 
+**自己导出依赖包（不需要仓库 tag）：**
+
+```bash
+./scripts/export-lib.sh                    # Linux / macOS
+powershell -File .\scripts\export-lib.ps1  # Windows
+```
+
+产物在 `out/dist/`：
+
+| 文件 | 用途 |
+|------|------|
+| `pipeline-core-1.0.0.jar` | JVM 项目：`implementation files('libs/pipeline-core-1.0.0.jar')` |
+| `pipeline-core-1.0.0-sources.jar` | IDE 里关联源码 |
+| `pipeline-core-1.0.0-src.zip` | 直接把 `com/devin/pipeline` 拷进自己的源码目录 |
+| `pipeline-core-android/`（`--module` / `-AsModule`） | Android Studio 模块，`include ':pipeline-core'` 即用 |
+
 ## 快速开始
 
 ```java
@@ -669,7 +685,8 @@ finally 资源清理、异步取消后资源仍然关闭。
   `ctx.cancelToken().isCancelled()`。框架无法杀死线程。
 - **共享的外部资源**（连接池、有状态服务）线程安全性由使用方保证，框架只保证自身不共享状态。
 - **拦截器、监听器、导出器不会改变执行结果** —— 它们抛出的异常一律被吞掉。
-- **Android 场景**：代码使用了 `List.of()` / `List.copyOf()` / `String.isBlank()`（API 30+）、
-  `java.time`（API 26+，可用 `coreLibraryDesugaring` 降版本）、`CompletableFuture`（API 24+）。
+- **Android 场景**：用 `scripts/export-lib.ps1 -AsModule` 导出并按模块引入；需要
+  `coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'` 才能使用 `java.time` 与
+  `List.of` / `Map.of`，`minSdk` 建议 24（`java.util.concurrent.CompletableFuture` 的限制）。
 
 基于 [Apache License 2.0](LICENSE) 发布。

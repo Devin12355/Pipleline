@@ -49,14 +49,14 @@ final class MiniYaml {
 
     /** Parses a document into {@code Map<String,Object>} / {@code List<Object>} / scalars. */
     static Object parse(String text) {
-        if (text == null || text.isBlank()) {
+        if (text == null || text.trim().isEmpty()) {
             return new LinkedHashMap<String, Object>();
         }
         List<Line> lines = new ArrayList<>();
         String[] raw = text.replace("\r\n", "\n").split("\n", -1);
         for (int i = 0; i < raw.length; i++) {
             String stripped = stripComment(raw[i]);
-            if (stripped.isBlank()) {
+            if (stripped.trim().isEmpty()) {
                 continue;
             }
             int indent = 0;

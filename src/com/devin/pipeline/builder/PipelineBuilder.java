@@ -83,7 +83,7 @@ public final class PipelineBuilder<C> {
         }
 
         private Pipeline.LoopStage<C> toStage(String defaultName) {
-            String loopName = (name == null || name.isBlank()) ? defaultName : name;
+            String loopName = (name == null || name.trim().isEmpty()) ? defaultName : name;
             return new Pipeline.LoopStage<>(loopName, body, condition, maxIterations, iterationErrorPolicy);
         }
     }
@@ -147,7 +147,7 @@ public final class PipelineBuilder<C> {
 
     public static <C> PipelineBuilder<C> of(String name) {
         Objects.requireNonNull(name, "name");
-        if (name.isBlank()) {
+        if (name.trim().isEmpty()) {
             throw new IllegalArgumentException("pipeline name must not be blank");
         }
         return new PipelineBuilder<>(name);
