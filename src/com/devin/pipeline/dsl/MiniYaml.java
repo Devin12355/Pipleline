@@ -66,7 +66,8 @@ final class MiniYaml {
             if (indent < stripped.length() && stripped.charAt(indent) == '\t') {
                 throw error(i + 1, "tabs are not supported, indent with spaces");
             }
-            String content = stripped.substring(indent);
+            // strip trailing blanks so a comment ("name: work # note") does not shift indentation
+            String content = stripped.substring(indent).stripTrailing();
             if (content.equals("---") || content.equals("...")) {
                 continue;
             }
@@ -195,13 +196,18 @@ final class MiniYaml {
         return s;
     }
 
+    /** Colon outside any quoting: both single and double quotes protect a key or value. */
     private static int findColon(String s) {
-        boolean quoted = false;
+        char quote = 0;
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);
-            if (c == '"') {
-                quoted = !quoted;
-            } else if (c == ':' && !quoted && (i + 1 == s.length() || s.charAt(i + 1) == ' ')) {
+            if (quote != 0) {
+                if (c == quote) {
+                    quote = 0;
+                }
+            } else if (c == '"' || c == '\'') {
+                quote = c;
+            } else if (c == ':' && (i + 1 == s.length() || s.charAt(i + 1) == ' ')) {
                 return i;
             }
         }
@@ -209,12 +215,16 @@ final class MiniYaml {
     }
 
     private static String stripComment(String line) {
-        boolean quoted = false;
+        char quote = 0;
         for (int i = 0; i < line.length(); i++) {
             char c = line.charAt(i);
-            if (c == '"') {
-                quoted = !quoted;
-            } else if (c == '#' && !quoted && (i == 0 || line.charAt(i - 1) == ' ')) {
+            if (quote != 0) {
+                if (c == quote) {
+                    quote = 0;
+                }
+            } else if (c == '"' || c == '\'') {
+                quote = c;
+            } else if (c == '#' && (i == 0 || line.charAt(i - 1) == ' ')) {
                 return line.substring(0, i);
             }
         }

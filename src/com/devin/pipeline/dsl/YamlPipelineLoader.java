@@ -29,7 +29,7 @@ import java.util.concurrent.Executor;
  *   - name, handler, when, retry, finally: true
  *   - name, loop: { while, maxIterations, onIterationError, stages }
  *   - name, subPipeline: &lt;registered pipeline id&gt;
- *   - name, parallel: { executor?, stages }
+ *   - name, parallel: { executor?, failFast?, stages }
  * </pre>
  */
 public final class YamlPipelineLoader {
@@ -167,7 +167,8 @@ public final class YamlPipelineLoader {
         if (executorId != null) {
             executor = registry.executor(String.valueOf(executorId));
         }
-        return new ParallelStage<>(name, branches, executor);
+        boolean failFast = truthy(parallelMap.get("failFast"));
+        return new ParallelStage<>(name, branches, executor, failFast);
     }
 
     @SuppressWarnings("unchecked")

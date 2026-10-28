@@ -10,20 +10,40 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Objects;
+import java.util.function.Consumer;
 
 /**
  * Writes {@code trace-<id>.md}: a Mermaid flowchart coloured by stage status, for post-hoc review.
+ *
+ * <p>Like {@link JsonTraceExporter} the output directory is mandatory: a relative path is not
+ * reliable on Android, where files must live under the app's own directories.
  */
 public final class MermaidExporter implements TraceExporter {
 
     private final Path directory;
+    private final Consumer<String> logger;
 
+    /**
+     * Fails by design: there is no reliable default directory across JVM and Android.
+     *
+     * @deprecated use {@link #MermaidExporter(Path)} with an explicit, platform specific directory.
+     */
+    @Deprecated
     public MermaidExporter() {
-        this(Path.of("out", "traces"));
+        throw new IllegalStateException("MermaidExporter needs an explicit directory: "
+                + "new MermaidExporter(Path.of(\"out\", \"traces\")) on the JVM, "
+                + "or new MermaidExporter(context.getFilesDir().toPath()) on Android.");
     }
 
     public MermaidExporter(Path directory) {
-        this.directory = directory == null ? Path.of("out", "traces") : directory;
+        this(directory, System.err::println);
+    }
+
+    /** @param logger where export failures are reported instead of {@code System.err}. */
+    public MermaidExporter(Path directory, Consumer<String> logger) {
+        this.directory = Objects.requireNonNull(directory, "directory");
+        this.logger = logger == null ? message -> { } : logger;
     }
 
     @Override
@@ -36,7 +56,7 @@ public final class MermaidExporter implements TraceExporter {
             Path file = directory.resolve("trace-" + trace.traceId() + ".md");
             Files.writeString(file, render(trace), StandardCharsets.UTF_8);
         } catch (IOException | RuntimeException e) {
-            System.err.println("[MermaidExporter] export failed for " + trace.traceId() + ": " + e);
+            logger.accept("[MermaidExporter] export failed for " + trace.traceId() + ": " + e);
         }
     }
 

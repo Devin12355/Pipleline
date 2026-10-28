@@ -19,14 +19,24 @@ public final class ParallelStage<C> implements Stage<C> {
     private final String name;
     private final List<Stage<C>> branches;
     private final Executor executor;
+    private final boolean failFast;
 
     public ParallelStage(String name, List<Stage<C>> branches, Executor executor) {
+        this(name, branches, executor, false);
+    }
+
+    /**
+     * @param failFast when true, a branch that stops (failure, abort, skip) cancels its siblings
+     *                 instead of letting them run to completion
+     */
+    public ParallelStage(String name, List<Stage<C>> branches, Executor executor, boolean failFast) {
         if (branches == null || branches.isEmpty()) {
             throw new IllegalArgumentException("parallel stage '" + name + "' needs at least one branch");
         }
         this.name = Objects.requireNonNull(name, "name");
         this.branches = List.copyOf(branches);
         this.executor = executor;
+        this.failFast = failFast;
     }
 
     @Override
@@ -41,6 +51,11 @@ public final class ParallelStage<C> implements Stage<C> {
     /** {@code null} means the engine default ({@code ForkJoinPool.commonPool()}). */
     public Executor executor() {
         return executor;
+    }
+
+    /** Whether a stopping branch cancels its siblings. */
+    public boolean failFast() {
+        return failFast;
     }
 
     /** Fallback used when such a stage is driven without the engine: sequential. */

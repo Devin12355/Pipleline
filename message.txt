@@ -1,0 +1,52 @@
+fix(core): 修复异步/并行执行路径的挂死与超时失效，并补齐 Android 适配
+
+本次为 Pipeline 框架设计缺陷审查后的集中修复，重点解决执行引擎在异步、并行、超时场景下的
+正确性问题，同时补齐 Android 集成缺失项。
+
+1. 修复 executeAsync 异常兜底缺失导致 future 永不完成
+   - engine 级异常（线程池拒绝提交、OOM 等）与 executor.execute 被拒时，handle 以异常完成
+     并置状态 FAILED，await() 不再永久阻塞；提交被拒时同步抛 RejectedExecutionException，
+     语义与 ExecutorService 保持一致。
+2. 修复并行分支内嵌套子管道的 deadline 数据竞争
+   - 移除共享可变字段 Exec.deadline，deadline 改为沿 runStageList / runUnit / runStage /
+     runLoop / runParallel / runNested 参数链传递，runNested 不再使用 save/restore 覆盖。
+3. 修复 timeout / cancel 对 join 完全失效
+   - runParallel 改为按剩余时间限时 join，到期取消未完成分支并返回 TIMEOUT；
+   - AsyncStage 新增 joinAsync()：按 100ms 切片等待 future，感知 cancel / interrupt /
+     deadline，超时取消底层 future 并以 TIMEOUT 结束执行。
+4. 修复并行分支失败信息丢失与无法快速失败
+   - 多分支失败改为聚合（首个原因为主，其余追加到消息），分支内 Error 不再被降级为阶段失败；
+   - 新增 failFast()（builder 与 YAML 的 parallel.failFast）在任一分支停止时取消兄弟分支。
+5. 修复重试退避不检查 deadline
+   - sleepBackoff 每个切片检查 deadline，重试耗尽剩余时间时收敛为 TIMEOUT 而非无限重试。
+6. 修复拦截器语义不对称
+   - beforeStage / afterStage 改为每次尝试成对调用，失败尝试先 afterStage 再 onStageError。
+7. 修复循环截断终态信息丢失
+   - 触达 maxIterations 时终态 reason 为 LOOP_TRUNCATED（状态仍为 COMPLETED，
+     trace.truncated 为 true），此前 FlowReason.loopTruncated() 是无法命中的死代码。
+8. 修复 ExecutionTrace 并发读取风险
+   - records() / hasFailure() 增加 synchronized 并返回快照拷贝，执行期间外部迭代不再触发
+     ConcurrentModificationException。
+9. 修复 StageContext.TypedKey 类型不安全
+   - 新增 of(name, Class) 携带类型 token，setAttr / getAttr 校验并抛出带 key 名称的
+     ClassCastException，避免同名不同类型的 key 互相误用。
+10. 修复 Pipeline 公开构造器绕过校验
+    - 补齐与 builder 一致的 name 非空 / 非空白校验。
+11. Android 适配
+    - JsonTraceExporter / MermaidExporter：输出目录改为必填，失败日志可注入（Android 传
+      Log.w）；LogTraceExporter 新增 Consumer<String> 行 sink，可直接接 logcat；
+    - 新增 addExporter(exporter, executor)，把导出 I/O 搬离收尾线程，避免主线程 ANR；
+    - README 中英文补充 minSdk / coreLibraryDesugaring、自带 Executor 替代
+      ForkJoinPool.commonPool()、轨迹写入 App 私有目录、禁止主线程 await 等注意事项。
+12. DSL 修复
+    - MiniYaml 支持单引号；修复注释前尾随空格被计入缩进导致子键解析失败的问题。
+
+行为变化说明：
+- new JsonTraceExporter() / new MermaidExporter() 不再默认写相对目录 out/traces（Android
+  scoped storage 下必然失败），改为直接抛出 IllegalStateException 并提示传入显式目录，
+  Android 请使用 context.getFilesDir().toPath()。
+
+验证：
+- javac 全量编译通过（JDK 17，零依赖）；19 项冒烟断言全部通过，覆盖 parallel / async 限时
+  join、failFast 取消、deadline 下的重试收敛、循环截断 reason、拦截器按尝试次数成对调用、
+  TypedKey 类型校验、导出器目录校验、YAML 单引号与注释缩进。

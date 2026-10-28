@@ -94,7 +94,11 @@ public final class ExecutionHandle<C> {
         return future.join();
     }
 
-    /** Waits at most the given time; returns {@code null} on timeout. */
+    /**
+     * Waits at most the given time; returns {@code null} both on timeout and when the execution
+     * failed with an engine level error. Use {@link #future()} when the caller needs to tell those
+     * two apart, or {@link #state()} to poll.
+     */
     public ExecutionResult<C> await(long timeout, TimeUnit unit) {
         try {
             return future.get(timeout, unit);
@@ -122,6 +126,11 @@ public final class ExecutionHandle<C> {
         future.complete(result);
     }
 
+    /**
+     * Fails the execution with an engine level error: the state becomes
+     * {@link ExecutionState#FAILED} and {@link #future()} completes exceptionally, so a blocked
+     * {@link #await()} never hangs.
+     */
     void completeExceptionally(Throwable error) {
         future.completeExceptionally(error);
     }

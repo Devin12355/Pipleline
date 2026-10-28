@@ -234,11 +234,16 @@ The child's own timeout, error handler and interceptors apply to its stages.
 ```java
 .parallel("enrich", p -> p
         .stages(callA, callB, callC)
-        .executor(myPool))                 // optional; default ForkJoinPool.commonPool()
+        .executor(myPool)                  // optional; default ForkJoinPool.commonPool()
+        .failFast())                       // optional; cancel siblings once one branch stops
 ```
 
 Branches share the same `StageContext`, so **do not write the same attrs / payload fields from
 different branches**. A failing branch follows the error policy.
+
+The join is **deadline aware**: with `.timeout(ms)`, branches that miss the deadline are cancelled
+and the execution ends as `TIMEOUT` instead of hanging. If several branches fail, the first reason
+wins and the rest are appended to its message rather than being dropped.
 
 ### Flow control: abort, skip, cancel, timeout
 
@@ -252,6 +257,10 @@ running `handle()` always completes — the framework never kills a stage.
 | Leave the enclosing loop only | `ctx.exitLoop()` | pipeline continues |
 | Stop from outside | `handle.cancel("user requested")` or `token.cancel("remote stop")` | `CANCELLED` |
 | Bound the execution | `.timeout(5_000)` | `TIMEOUT` |
+
+The deadline is checked at stage boundaries, before every loop iteration, while a `ParallelStage`
+group is joined, and while an `AsyncStage` future is awaited — the two join points cancel the
+underlying futures instead of blocking past the deadline.
 
 ```java
 CancelToken token = new CancelToken();                 // hand it to a message listener
@@ -275,7 +284,7 @@ Terminal states:
 | exception + `ABORT` policy | `FAILED` |
 | `cancel()` | `CANCELLED` |
 | `.timeout(ms)` exceeded | `TIMEOUT` |
-| `maxIterations` reached | `COMPLETED` (trace `truncated`) |
+| `maxIterations` reached | `COMPLETED` (`reason.type() == LOOP_TRUNCATED`, trace `truncated`) |
 
 `FlowReason` (`type` + `code` + `message`) carries *why* it ended, separately from the state.
 
@@ -378,15 +387,20 @@ duration, error, attempts.
 | Exporter | Output |
 |----------|--------|
 | `LogTraceExporter` | structured log: one summary line + one line per stage |
-| `JsonTraceExporter(Path)` | `trace-<id>.json` for machines / log platforms |
+| `JsonTraceExporter(Path)` | `trace-<id>.json` for machines / log platforms (directory is mandatory) |
 | `MermaidExporter(Path)` | `trace-<id>.md` flowchart colored by status |
 
 ```java
 .addExporter(new LogTraceExporter())
 .addExporter(new JsonTraceExporter(Path.of("out", "traces")))
 .addExporter(new MermaidExporter(Path.of("out", "traces")))
+.addExporter(new JsonTraceExporter(traces), ioPool)   // export off the execution thread
 .traceDisabled()                          // turn capture off entirely
 ```
+
+Exporters normally run inline on the thread that finished the execution; hand over an executor
+(`addExporter(exporter, executor)`) when the export does I/O on a latency sensitive thread such as
+an Android main thread.
 
 Reading a trace:
 
@@ -496,7 +510,7 @@ tags are not supported.
 | `StageRecord` | `index()`, `stageName()`, `loopName()`, `iteration()`, `status()`, `durationMs()`, `error()`, `attempts()` |
 | `PipelineBuilder<C>` | `addStage(s)` / `addStages(...)`, `loop(cfg)`, `parallel(name, cfg)`, `subPipeline(name, p)`, `finallyStage(s)`, `errorHandler(h)`, `retryPolicy(p)`, `timeout(ms)`, `traceEnabled(bool)` / `traceDisabled()`, `addInterceptor`, `addListener`, `addExporter`, `build()` |
 | Loop config | `name`, `stages(...)`, `addStage`, `while_(cond)`, `maxIterations(n)`, `onIterationError(action)` |
-| Parallel config | `stages(...)`, `addStage`, `executor(e)` |
+| Parallel config | `stages(...)`, `addStage`, `executor(e)`, `failFast()` / `failFast(bool)` |
 
 ## Example 1: order pipeline
 
@@ -700,8 +714,27 @@ cancellation where the finally stage still closes the camera.
 - **Shared external resources** (connection pools, stateful services) must be thread-safe on your
   side; the framework only guarantees that it shares nothing.
 - **Interceptors, listeners and exporters never change an outcome** — their exceptions are swallowed.
+- **Async always completes**: if the engine dies with an unexpected `Error`, or the executor rejects
+  the task, `executeAsync` completes the handle exceptionally (`state() == FAILED`) instead of
+  leaving `await()` blocked forever. Catch it through `handle.future()`.
 - **Android**: compile and export with `scripts/export-lib.ps1 -AsModule` — add
   `coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'` for `java.time` and the
   `List.of` / `Map.of` factory methods, and set `minSdk 24` (`java.util.concurrent.CompletableFuture`).
+  Three more Android specifics:
+
+  ```kotlin
+  // 1. bring your own executor: ForkJoinPool.commonPool() competes with the app's own work
+  val ioPool = Executors.newFixedThreadPool(2)
+  val handle = pipeline.executeAsync(payload, ioPool)
+  pipeline.parallel("enrich") { p -> p.stages(a, b).executor(ioPool).failFast() }
+
+  // 2. traces must live inside the app's storage - there is no usable working directory
+  pipeline.addExporter(JsonTraceExporter(context.filesDir.toPath()) { m -> Log.w("Pipeline", m) }, ioPool)
+
+  // 3. System.out is discarded on a device
+  pipeline.addExporter(LogTraceExporter { line -> Log.d("Pipeline", line) })
+  ```
+
+  Never call `handle.await()` on the main thread.
 
 Licensed under the [Apache License 2.0](LICENSE).

@@ -14,40 +14,79 @@ import java.util.Objects;
  * through every stage: the payload is mutated in place (zero copy) while {@code attrs} carry
  * auxiliary data. Because one execution is single-threaded, plain collections are enough.
  *
+ * <p><b>Parallel exception.</b> {@code ParallelStage} deliberately shares one context across
+ * branches: {@code attrs} is a plain {@link HashMap}, so branches must not write the same keys
+ * (or the same payload fields) concurrently. {@code abort()}, {@code skipRest()} and
+ * {@code exitLoop()} are flags, not signals: they are honoured at the next stage boundary and
+ * never interrupt a running branch. Prefer distinct keys per branch, or {@code failFast} plus a
+ * join stage that merges the branch results.
+ *
  * @param <C> payload type
  */
 public final class StageContext<C> {
 
-    /** Type safe attribute key; collect them in constant classes to form a data contract. */
+    /**
+     * Type safe attribute key; collect them in constant classes to form a data contract.
+     *
+     * <p>{@link #of(String, Class)} additionally carries the value type, so a mismatch is caught
+     * on read with a message naming the key instead of a raw {@code ClassCastException} deep in
+     * caller code. Keys created with {@link #of(String)} stay untyped (legacy behaviour) and are
+     * not equal to typed keys of the same name.
+     */
     public static final class TypedKey<T> {
 
         private final String name;
+        private final Class<T> type;
 
-        private TypedKey(String name) {
+        private TypedKey(String name, Class<T> type) {
             this.name = name;
+            this.type = type;
         }
 
         public static <T> TypedKey<T> of(String name) {
-            return new TypedKey<>(Objects.requireNonNull(name, "name"));
+            return new TypedKey<>(Objects.requireNonNull(name, "name"), null);
+        }
+
+        public static <T> TypedKey<T> of(String name, Class<T> type) {
+            return new TypedKey<>(Objects.requireNonNull(name, "name"),
+                    Objects.requireNonNull(type, "type"));
         }
 
         public String name() {
             return name;
         }
 
+        /** Declared value type, {@code null} when the key was created without one. */
+        public Class<T> type() {
+            return type;
+        }
+
+        /** Throws a key naming {@code ClassCastException} when the value does not fit the key. */
+        void checkValue(Object value) {
+            if (type == null || value == null) {
+                return;
+            }
+            if (!type.isInstance(value)) {
+                throw new ClassCastException("attr '" + name + "' holds "
+                        + value.getClass().getName() + " but was declared as " + type.getName());
+            }
+        }
+
         @Override
         public boolean equals(Object o) {
-            return o instanceof TypedKey<?> other && name.equals(other.name);
+            return o instanceof TypedKey<?> other
+                    && name.equals(other.name)
+                    && Objects.equals(type, other.type);
         }
 
         @Override
         public int hashCode() {
-            return name.hashCode();
+            return 31 * name.hashCode() + Objects.hashCode(type);
         }
 
         @Override
         public String toString() {
-            return name;
+            return type == null ? name : name + ":" + type.getSimpleName();
         }
     }
 
@@ -112,6 +151,7 @@ public final class StageContext<C> {
     }
 
     public <V> StageContext<C> setAttr(TypedKey<V> key, V value) {
+        key.checkValue(value);
         attrs.put(key.name(), value);
         return this;
     }
@@ -132,7 +172,9 @@ public final class StageContext<C> {
 
     @SuppressWarnings("unchecked")
     public <V> V getAttr(TypedKey<V> key) {
-        return (V) attrs.get(key.name());
+        Object value = attrs.get(key.name());
+        key.checkValue(value);
+        return (V) value;
     }
 
     public <V> V getAttr(TypedKey<V> key, V defaultValue) {

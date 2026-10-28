@@ -210,7 +210,8 @@ int score = ctx.getAttr(OrderAttrs.RISK_SCORE);          // 无需强转
 - `ctx.exitLoop()` 在当前圈结束后离开循环，流水线继续
 - `ctx.currentLoop().iteration` 是从 1 开始的计数；每圈每个阶段都有自己的 `StageRecord`
   （`loop=record, iteration=N`）
-- 触达 `maxIterations` 时以 `COMPLETED` 结束，轨迹标记 `truncated`
+- 触达 `maxIterations` 时以 `COMPLETED` 结束，轨迹标记 `truncated`，终态 reason 类型为
+  `LOOP_TRUNCATED`
 
 **子流水线** —— 一条流水线作为另一条的阶段：
 
@@ -230,11 +231,16 @@ ErrorHandler、拦截器作用于它的阶段。
 ```java
 .parallel("enrich", p -> p
         .stages(callA, callB, callC)
-        .executor(myPool))                 // 可选，默认 ForkJoinPool.commonPool()
+        .executor(myPool)                  // 可选，默认 ForkJoinPool.commonPool()
+        .failFast())                       // 可选：任一分支停止即取消兄弟分支
 ```
 
 分支共享同一个 `StageContext`，因此**不要在不同分支里写同一个 attr / payload 字段**；失败分支
 按错误策略处理。
+
+join 过程**受 deadline 约束**：设置了 `.timeout(ms)` 后，超时未完成的分支会被取消，执行以
+`TIMEOUT` 结束而不是无限等待；多个分支同时失败时，第一个原因作为主原因，其余追加在消息里，不会被
+静默丢弃。
 
 ### 流程控制：中止 / 跳过 / 取消 / 超时
 
@@ -247,6 +253,9 @@ ErrorHandler、拦截器作用于它的阶段。
 | 只跳出当前循环 | `ctx.exitLoop()` | 流水线继续 |
 | 外部停止 | `handle.cancel("用户取消")` 或 `token.cancel("远程停止")` | `CANCELLED` |
 | 限制执行时长 | `.timeout(5_000)` | `TIMEOUT` |
+
+deadline 在阶段边界、每轮循环开始前、`ParallelStage` 的 join 期间、`AsyncStage` 的 future 等待
+期间都会检查；后两个 join 点是取消底层 future，而不是继续阻塞到 deadline 之后。
 
 ```java
 CancelToken token = new CancelToken();                 // 交给消息监听器持有
@@ -269,7 +278,7 @@ ExecutionResult<Order> result = handle.await();        // 取消不会抛异常
 | 异常 + `ABORT` 策略 | `FAILED` |
 | `cancel()` | `CANCELLED` |
 | 超过 `.timeout(ms)` | `TIMEOUT` |
-| 触达 `maxIterations` | `COMPLETED`（轨迹 `truncated`） |
+| 触达 `maxIterations` | `COMPLETED`（`reason.type() == LOOP_TRUNCATED`，轨迹 `truncated`） |
 
 `FlowReason`（`type` + `code` + `message`）独立于状态，说明“为什么结束”。
 
@@ -368,15 +377,19 @@ ExecutionResult<RecordSession> result = handle.await();     // 或 handle.future
 | 导出器 | 产物 |
 |--------|------|
 | `LogTraceExporter` | 结构化日志：一行汇总 + 每阶段一行 |
-| `JsonTraceExporter(Path)` | `trace-<id>.json`，供机器 / 日志平台消费 |
+| `JsonTraceExporter(Path)` | `trace-<id>.json`，供机器 / 日志平台消费（目录必填） |
 | `MermaidExporter(Path)` | `trace-<id>.md` 流程图，按状态着色 |
 
 ```java
 .addExporter(new LogTraceExporter())
 .addExporter(new JsonTraceExporter(Path.of("out", "traces")))
 .addExporter(new MermaidExporter(Path.of("out", "traces")))
+.addExporter(new JsonTraceExporter(traces), ioPool)   // 导出搬离执行线程
 .traceDisabled()                          // 完全关闭采集
 ```
+
+导出器默认在收尾线程上内联执行；`addExporter(exporter, executor)` 可把导出 I/O 交给指定线程池，
+用于 Android 主线程等对延迟敏感的收尾线程。
 
 读取轨迹：
 
@@ -485,7 +498,7 @@ stages:
 | `StageRecord` | `index()`、`stageName()`、`loopName()`、`iteration()`、`status()`、`durationMs()`、`error()`、`attempts()` |
 | `PipelineBuilder<C>` | `addStage(s)` / `addStages(...)`、`loop(cfg)`、`parallel(name, cfg)`、`subPipeline(name, p)`、`finallyStage(s)`、`errorHandler(h)`、`retryPolicy(p)`、`timeout(ms)`、`traceEnabled(bool)` / `traceDisabled()`、`addInterceptor`、`addListener`、`addExporter`、`build()` |
 | 循环配置 | `name`、`stages(...)`、`addStage`、`while_(cond)`、`maxIterations(n)`、`onIterationError(action)` |
-| 并行配置 | `stages(...)`、`addStage`、`executor(e)` |
+| 并行配置 | `stages(...)`、`addStage`、`executor(e)`、`failFast()` / `failFast(bool)` |
 
 ## 示例一：订单流水线
 
@@ -684,9 +697,30 @@ finally 资源清理、异步取消后资源仍然关闭。
 - **取消是协作式的**：`future.cancel(true)` 只能中断阻塞操作；CPU 密集型阶段应自行轮询
   `ctx.cancelToken().isCancelled()`。框架无法杀死线程。
 - **共享的外部资源**（连接池、有状态服务）线程安全性由使用方保证，框架只保证自身不共享状态。
-- **拦截器、监听器、导出器不会改变执行结果** —— 它们抛出的异常一律被吞掉。
+- **拦截器、监听器、导出器不会改变执行结果** —— 它们抛出的异常一律被吞掉。拦截器是
+  **按尝试次数**调用的：每次尝试的 `beforeStage` / `afterStage` 成对出现（失败尝试也会先
+  `afterStage` 再 `onStageError`）。
+- **异步执行一定会收口**：引擎抛出意外 `Error`、或线程池拒绝提交任务时，`executeAsync` 会
+  把 handle 以异常完成（`state() == FAILED`），`await()` 不会永久阻塞；通过 `handle.future()`
+  捕获该异常。
 - **Android 场景**：用 `scripts/export-lib.ps1 -AsModule` 导出并按模块引入；需要
   `coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'` 才能使用 `java.time` 与
   `List.of` / `Map.of`，`minSdk` 建议 24（`java.util.concurrent.CompletableFuture` 的限制）。
+  另外三点：
+
+  ```kotlin
+  // 1. 自带线程池：ForkJoinPool.commonPool() 会和 App 自身的任务抢线程
+  val ioPool = Executors.newFixedThreadPool(2)
+  val handle = pipeline.executeAsync(payload, ioPool)
+  pipeline.parallel("enrich") { p -> p.stages(a, b).executor(ioPool).failFast() }
+
+  // 2. 轨迹文件必须落在 App 私有目录：Android 没有可用的工作目录
+  pipeline.addExporter(JsonTraceExporter(context.filesDir.toPath()) { m -> Log.w("Pipeline", m) }, ioPool)
+
+  // 3. System.out 在设备上会被丢弃
+  pipeline.addExporter(LogTraceExporter { line -> Log.d("Pipeline", line) })
+  ```
+
+  不要在主线程调用 `handle.await()`。
 
 基于 [Apache License 2.0](LICENSE) 发布。

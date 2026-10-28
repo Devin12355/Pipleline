@@ -9,20 +9,45 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Objects;
+import java.util.function.Consumer;
 
 /**
  * Writes {@code trace-<id>.json} into the configured directory for machines and log platforms.
+ *
+ * <p>The directory is mandatory: a relative path such as {@code out/traces} depends on the process
+ * working directory, which does not exist in an Android app (files must live under
+ * {@code context.getFilesDir()}, {@code getCacheDir()} or a scoped storage location).
+ *
+ * <p>Export failures go to an injectable sink - {@code System.err} is invisible on Android, so pass
+ * {@code message -> Log.w("Pipeline", message)} there.
  */
 public final class JsonTraceExporter implements TraceExporter {
 
     private final Path directory;
+    private final Consumer<String> logger;
 
+    /**
+     * Fails by design: there is no reliable default directory across JVM and Android.
+     *
+     * @deprecated use {@link #JsonTraceExporter(Path)} with an explicit, platform specific
+     *             directory (for example {@code context.getFilesDir().toPath()}).
+     */
+    @Deprecated
     public JsonTraceExporter() {
-        this(Path.of("out", "traces"));
+        throw new IllegalStateException("JsonTraceExporter needs an explicit directory: "
+                + "new JsonTraceExporter(Path.of(\"out\", \"traces\")) on the JVM, "
+                + "or new JsonTraceExporter(context.getFilesDir().toPath()) on Android.");
     }
 
     public JsonTraceExporter(Path directory) {
-        this.directory = directory == null ? Path.of("out", "traces") : directory;
+        this(directory, System.err::println);
+    }
+
+    /** @param logger where export failures are reported instead of {@code System.err}. */
+    public JsonTraceExporter(Path directory, Consumer<String> logger) {
+        this.directory = Objects.requireNonNull(directory, "directory");
+        this.logger = logger == null ? message -> { } : logger;
     }
 
     @Override
@@ -35,7 +60,7 @@ public final class JsonTraceExporter implements TraceExporter {
             Path file = directory.resolve("trace-" + trace.traceId() + ".json");
             Files.writeString(file, toJson(trace), StandardCharsets.UTF_8);
         } catch (IOException | RuntimeException e) {
-            System.err.println("[JsonTraceExporter] export failed for " + trace.traceId() + ": " + e);
+            logger.accept("[JsonTraceExporter] export failed for " + trace.traceId() + ": " + e);
         }
     }
 

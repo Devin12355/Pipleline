@@ -24,6 +24,7 @@ public final class ExecutionTrace {
     private volatile long durationMs = -1L;
     private volatile boolean truncated;
     private volatile FlowReason reason;
+    private volatile FlowReason truncationReason;
 
     public ExecutionTrace(String traceId, String pipelineName, Instant startTime) {
         this.traceId = traceId;
@@ -41,6 +42,19 @@ public final class ExecutionTrace {
     /** Marks the trace as not having ended naturally (e.g. maxIterations bound reached). */
     public void markTruncated() {
         this.truncated = true;
+    }
+
+    /** Same as {@link #markTruncated()} plus the reason to surface in the terminal result. */
+    public void markTruncated(FlowReason reason) {
+        this.truncated = true;
+        if (reason != null) {
+            this.truncationReason = reason;
+        }
+    }
+
+    /** Why the trace was truncated, {@code null} when it was not (or carried no reason). */
+    public FlowReason truncationReason() {
+        return truncationReason;
     }
 
     /** Completes the trace with the terminal reason. */
@@ -78,11 +92,12 @@ public final class ExecutionTrace {
         return reason;
     }
 
-    public List<StageRecord> records() {
-        return Collections.unmodifiableList(records);
+    /** Snapshot copy of the records so far; safe to iterate while the execution is still running. */
+    public synchronized List<StageRecord> records() {
+        return Collections.unmodifiableList(List.copyOf(records));
     }
 
-    public boolean hasFailure() {
+    public synchronized boolean hasFailure() {
         for (StageRecord record : records) {
             if (record.status() == StageStatus.FAILED) {
                 return true;

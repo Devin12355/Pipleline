@@ -9,6 +9,7 @@ import com.devin.pipeline.core.control.ErrorHandler;
 import com.devin.pipeline.core.control.Interceptor;
 import com.devin.pipeline.core.control.RetryPolicy;
 import com.devin.pipeline.core.event.PipelineListener;
+import com.devin.pipeline.core.trace.ExecutionTrace;
 import com.devin.pipeline.core.trace.TraceExporter;
 
 import java.util.ArrayList;
@@ -93,6 +94,7 @@ public final class PipelineBuilder<C> {
 
         private final List<Stage<C>> branches = new ArrayList<>();
         private Executor executor;
+        private boolean failFast;
 
         private ParallelBuilder() {
         }
@@ -124,8 +126,21 @@ public final class PipelineBuilder<C> {
             return this;
         }
 
+        /**
+         * Fail fast: as soon as one branch stops (failure, abort, skip) the still running
+         * siblings are cancelled. Default {@code false}: every branch runs to completion.
+         */
+        public ParallelBuilder<C> failFast() {
+            return failFast(true);
+        }
+
+        public ParallelBuilder<C> failFast(boolean enabled) {
+            this.failFast = enabled;
+            return this;
+        }
+
         private ParallelStage<C> toStage(String name) {
-            return new ParallelStage<>(name, branches, executor);
+            return new ParallelStage<>(name, branches, executor, failFast);
         }
     }
 
@@ -246,6 +261,33 @@ public final class PipelineBuilder<C> {
 
     public PipelineBuilder<C> addExporter(TraceExporter exporter) {
         exporters.add(Objects.requireNonNull(exporter, "exporter"));
+        return this;
+    }
+
+    /**
+     * Exporters run inline on the execution thread by default (file I/O included). On Android - or
+     * any latency sensitive caller - hand over an executor so the export never blocks the
+     * finishing thread.
+     */
+    public PipelineBuilder<C> addExporter(TraceExporter exporter, Executor executor) {
+        Objects.requireNonNull(exporter, "exporter");
+        Objects.requireNonNull(executor, "executor");
+        exporters.add(new TraceExporter() {
+            @Override
+            public void export(ExecutionTrace trace) {
+                try {
+                    executor.execute(() -> {
+                        try {
+                            exporter.export(trace);
+                        } catch (Throwable ignored) {
+                            // observation must never change an outcome
+                        }
+                    });
+                } catch (Throwable ignored) {
+                    // submitting failed: the trace is simply not exported
+                }
+            }
+        });
         return this;
     }
 
