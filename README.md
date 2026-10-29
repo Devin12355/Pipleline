@@ -1,10 +1,10 @@
-# Java Pipeline Framework
+# Android Pipeline Framework
 
-A lightweight, embeddable, zero-dependency workflow pipeline framework for the JVM (JDK 17+).
+A lightweight, Android-first workflow pipeline framework for production app runtime.
 
-It splits a business process (order processing, ETL, approval flow, message handling) into ordered,
-independent, reusable stages and takes care of orchestration, data flow, cross-cutting concerns,
-fault tolerance and flow control for you.
+It splits a business process (order processing, background orchestration, approval flow, message handling) into ordered,
+independent, reusable stages and takes care of orchestration, explicit scheduling, lifecycle-aware cancellation,
+error handling and flow control for Android apps.
 
 - [中文文档](README.zh-CN.md)
 - Licensed under the [Apache License 2.0](LICENSE)
@@ -33,7 +33,7 @@ fault tolerance and flow control for you.
 
 ## Install
 
-**Requirements**: JDK 17+, no runtime dependencies (the framework itself is dependency-free).
+**Requirements**: Android runtime with explicit app-provided executors; framework itself stays dependency-light and Android-safe.
 
 **As a dependency (JitPack, once the repository has a tag):**
 
@@ -229,12 +229,12 @@ The child runs with the **same** `StageContext`, trace, cancel token and deadlin
 child stage records land in the parent trace, and `abort()` / `skipRest()` / cancel propagate.
 The child's own timeout, error handler and interceptors apply to its stages.
 
-**Parallel group** — branches run concurrently, joined before the pipeline continues:
+**Parallel group** — branches run concurrently on an app-provided executor, joined before the pipeline continues:
 
 ```java
 .parallel("enrich", p -> p
         .stages(callA, callB, callC)
-        .executor(myPool)                  // optional; default ForkJoinPool.commonPool()
+        .executor(myPool)                  // required for Android-safe scheduling
         .failFast())                       // optional; cancel siblings once one branch stops
 ```
 

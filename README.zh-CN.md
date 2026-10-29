@@ -1,9 +1,9 @@
-# Java Pipeline 框架
+# Android Pipeline 框架
 
-一个轻量、可嵌入、零依赖的 JVM 工作流流水线框架（JDK 17+）。
+一个轻量、面向 Android 生产环境的工作流流水线框架。
 
-它把业务流程（订单处理、ETL、审批流、消息处理）拆成有序、独立、可复用的阶段，由框架负责编排、
-数据流转、横切关注点、容错与流程控制。
+它把业务流程（订单处理、后台编排、审批流、消息处理）拆成有序、独立、可复用的阶段，由框架负责编排、
+显式调度、生命周期感知取消、错误处理与流程控制，适用于 Android App 场景。
 
 - [English](README.md)
 - 基于 [Apache License 2.0](LICENSE) 发布
@@ -32,7 +32,7 @@
 
 ## 安装与引入
 
-**环境要求**：JDK 17+，框架本身零运行时依赖。
+**环境要求**：Android 运行时，并且任务调度必须由应用显式提供 Executor / Dispatcher；框架本身保持轻量且 Android-safe。
 
 **作为依赖引入（JitPack，仓库打 tag 后可用）：**
 
@@ -226,12 +226,12 @@ PipelineBuilder.<Order>of("order-pipeline")
 落在父级轨迹里，`abort()` / `skipRest()` / 取消都会向父级传播；子流水线自己的 timeout、
 ErrorHandler、拦截器作用于它的阶段。
 
-**并行组** —— 分支并发执行，全部 join 后流水线才继续：
+**并行组** —— 分支并发执行，全部 join 后流水线才继续，且必须使用应用提供的 executor：
 
 ```java
 .parallel("enrich", p -> p
         .stages(callA, callB, callC)
-        .executor(myPool)                  // 可选，默认 ForkJoinPool.commonPool()
+        .executor(myPool)                  // Android-safe 调度，必须显式提供
         .failFast())                       // 可选：任一分支停止即取消兄弟分支
 ```
 

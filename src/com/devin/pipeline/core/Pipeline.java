@@ -25,7 +25,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
-import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -272,9 +271,15 @@ public final class Pipeline<C> {
         return result;
     }
 
-    /** Submits the execution to the common pool and returns immediately. */
+    /**
+     * Android production requirement: async execution must be explicit.
+     * The caller must provide the target executor, because implicit JVM defaults are not safe for
+     * Android lifecycle-sensitive workloads.
+     */
     public ExecutionHandle<C> executeAsync(C payload) {
-        return executeAsync(payload, ForkJoinPool.commonPool());
+        throw new UnsupportedOperationException(
+                "Android production mode requires an explicit executor. Use executeAsync(payload, executor)."
+        );
     }
 
     /**
@@ -560,7 +565,7 @@ public final class Pipeline<C> {
     private FlowReason runParallel(Exec<C> e, ExecutionTrace trace, ParallelStage<C> parallel,
                                    String scope, int iteration, ErrorAction errorPolicy, long deadline) {
         String branchScope = scope == null ? parallel.name() : scope + "/" + parallel.name();
-        Executor executor = parallel.executor() != null ? parallel.executor() : ForkJoinPool.commonPool();
+        Executor executor = parallel.executor();
         List<CompletableFuture<FlowReason>> futures = new ArrayList<>();
         for (Stage<C> branch : parallel.branches()) {
             CompletableFuture<FlowReason> future = CompletableFuture.supplyAsync(() -> {

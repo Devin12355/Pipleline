@@ -140,6 +140,11 @@ public final class PipelineBuilder<C> {
         }
 
         private ParallelStage<C> toStage(String name) {
+            if (executor == null) {
+                throw new IllegalArgumentException(
+                        "parallel stage '" + name + "' requires an explicit executor for Android-safe execution"
+                );
+            }
             return new ParallelStage<>(name, branches, executor, failFast);
         }
     }
